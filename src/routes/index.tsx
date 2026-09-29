@@ -1,39 +1,34 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js';
-import { createStore, produce } from 'solid-js/store';
-import { createQuery, useQueryClient } from '@tanstack/solid-query';
-import { createForm, zodForm } from '@modular-forms/solid';
+import { createStore } from 'solid-js/store';
+import { createForm, zodForm, setValue } from '@modular-forms/solid';
 import { Tabs } from '@ark-ui/solid';
 import { flatten, resolveTemplate, translator } from '@solid-primitives/i18n';
 import { z } from 'zod';
-
-type IssueStatus = 'open' | 'triaged' | 'fixing' | 'verifying' | 'closed' | 'reopened';
-type Severity = 'critical' | 'serious' | 'moderate' | 'minor';
-interface AuditIssue {
-  id: string;
-  title: string;
-  flow: string;
-  steps: string;
-  impactGroup: string;
-  severity: Severity;
-  status: IssueStatus;
-  canonicalId?: string;
-  fixNote: string;
-  retestNote: string;
-  updatedAt: string;
-}
-interface AuditEvent { id: string; at: string; issueId: string; message: string }
-interface WorkbenchState { issues: AuditIssue[]; events: AuditEvent[] }
-
-const seed: WorkbenchState = {
-  issues: [
-    { id: 'issue-1', title: '结算弹窗关闭后焦点丢失', flow: '订单结算', steps: '1. 打开结算弹窗\n2. 按 Esc 关闭\n3. 按 Tab 检查焦点', impactGroup: '键盘与读屏用户', severity: 'serious', status: 'triaged', fixNote: '', retestNote: '', updatedAt: new Date(Date.now() - 3600_000).toISOString() },
-    { id: 'issue-2', title: '错误提示未与输入框关联', flow: '账户设置', steps: '输入无效手机号后使用读屏读取输入框', impactGroup: '读屏用户', severity: 'moderate', status: 'fixing', fixNote: '已增加 aria-describedby，等待构建', retestNote: '', updatedAt: new Date(Date.now() - 7200_000).toISOString() }
-  ],
-  events: [
-    { id: 'e-1', at: new Date(Date.now() - 3600_000).toISOString(), issueId: 'issue-1', message: '审核员确认问题有效并进入修复中' },
-    { id: 'e-2', at: new Date(Date.now() - 7000_000).toISOString(), issueId: 'issue-2', message: '开发人员提交焦点管理修复' }
-  ]
-};
+import {
+  type AuditIssue,
+  type AuditEvent,
+  type FieldChange,
+  type ChangeOperation,
+  type WorkbenchState,
+  type OutboxState,
+  type NetworkStatus,
+  type Severity,
+  FIELD_LABELS,
+  loadServer,
+  loadLocal,
+  loadOutbox,
+  saveServer,
+  saveLocal,
+  saveOutbox,
+  applyEdit,
+  applyCreate,
+  mergeIssues,
+  syncOutbox,
+  resolveFieldConflict,
+  resolveCanonical,
+  pendingConflicts,
+  pendingBatches
+} from '~/lib/collab';
 
 const issueSchema = z.object({
   title: z.string().min(4, '标题至少4个字'),
@@ -49,56 +44,170 @@ const dictionaries = {
   en: flatten({ title: 'Accessibility Audit Workbench', subtitle: 'Issues, fixes and retesting', issues: 'Audit issues', merge: 'Duplicate merge', events: 'Activity timeline' })
 };
 
-function loadState(): WorkbenchState {
-  if (typeof localStorage === 'undefined') return seed;
-  try { return JSON.parse(localStorage.getItem('a11y-audit-v1') ?? 'null') as WorkbenchState ?? seed; } catch { return seed; }
-}
-
 export default function AuditWorkbench() {
-  const queryClient = useQueryClient();
   const [language, setLanguage] = createSignal<'zh' | 'en'>('zh');
   const t = createMemo(() => translator(() => dictionaries[language()], resolveTemplate));
-  const [state, setState] = createStore<WorkbenchState>(loadState());
-  const [selectedId, setSelectedId] = createSignal(state.issues[0]?.id ?? '');
+
+  // 服务端副本（共享事实来源）、本地工作副本（离线可编辑）、离线批次队列
+  const [server, setServer] = createStore<WorkbenchState>(loadServer());
+  const [local, setLocal] = createStore<WorkbenchState>(loadLocal());
+  const [outbox, setOutbox] = createStore<OutboxState>(loadOutbox());
+
+  const [network, setNetwork] = createSignal<NetworkStatus>('online');
+  const [forceFailure, setForceFailure] = createSignal(false);
+  const [author, setAuthor] = createSignal('审核员');
+  const [selectedId, setSelectedId] = createSignal(local.issues[0]?.id ?? '');
   const [mergeInto, setMergeInto] = createSignal('');
-  const [focusedIssueId, setFocusedIssueId] = createSignal('');
-  const issueQuery = createQuery(() => ({
-    queryKey: ['audit-issues', state.issues.length],
-    queryFn: async () => new Promise<AuditIssue[]>((resolve) => window.setTimeout(() => resolve(state.issues), 120))
-  }));
+  const [syncMsg, setSyncMsg] = createSignal('');
 
   const [form, { Form: AuditForm, Field: AuditField }] = createForm<IssueForm>({
     initialValues: { title: '', flow: '', steps: '', impactGroup: '键盘与读屏用户', severity: 'serious' },
     validate: zodForm(issueSchema)
   });
 
-  const selected = createMemo(() => state.issues.find((issue) => issue.id === selectedId()) ?? state.issues[0]);
+  // 持久化
+  createEffect(() => saveServer(server));
+  createEffect(() => saveLocal(local));
+  createEffect(() => saveOutbox(outbox));
 
-  createEffect(() => {
-    if (typeof localStorage !== 'undefined') localStorage.setItem('a11y-audit-v1', JSON.stringify(state));
-  });
+  const selectedRaw = createMemo(() => local.issues.find((issue) => issue.id === selectedId()));
+  const selected = createMemo(() => resolveCanonical(local, selectedId()) ?? selectedRaw());
+  const isMergedView = createMemo(() => !!selectedRaw()?.canonicalId && selectedRaw()!.canonicalId !== selected()?.id);
 
-  const addEvent = (issueId: string, message: string) => setState('events', (events) => [{ id: crypto.randomUUID(), at: new Date().toISOString(), issueId, message }, ...events]);
-  const updateIssue = (id: string, patch: Partial<AuditIssue>, message: string) => {
-    setState('issues', (issue) => issue.id === id, produce((issue) => Object.assign(issue, patch, { updatedAt: new Date().toISOString() })));
-    addEvent(id, message);
-    void queryClient.invalidateQueries({ queryKey: ['audit-issues'] });
+  const conflictCount = createMemo(() => pendingConflicts(server));
+  const pendingBatchCount = createMemo(() => pendingBatches(outbox));
+
+  const commitServer = (next: WorkbenchState) => {
+    setServer(next);
+    setLocal(structuredClone(next));
+  };
+  const commitLocal = (next: WorkbenchState) => setLocal(next);
+
+  /** 把离线操作按原记录（issueId）排入队列：同一问题的离线修改归到一个 queued 批次。 */
+  const enqueueOp = (op: ChangeOperation) => {
+    setOutbox('batches', (batches) => {
+      const existing = batches.find((b) => b.status === 'queued' && b.ops.some((o) => o.issueId === op.issueId));
+      if (existing) {
+        return batches.map((b) => (b.batchId === existing.batchId ? { ...b, ops: [...b.ops, op] } : b));
+      }
+      return [...batches, { batchId: crypto.randomUUID(), createdAt: new Date().toISOString(), ops: [op], status: 'queued' }];
+    });
+  };
+
+  /** 在线：直接写入服务端；离线：乐观写入本地并排队。每条修改都带修订号。 */
+  const editIssue = (issueId: string, changes: FieldChange[], message: string) => {
+    const now = new Date().toISOString();
+    const target = resolveCanonical(local, issueId) ?? local.issues.find((i) => i.id === issueId);
+    const baseRevision = target?.revision ?? 1;
+    if (network() === 'online') {
+      const { state: next } = applyEdit(server, issueId, changes, { message, author: author(), at: now });
+      commitServer(next);
+    } else {
+      const { state: next } = applyEdit(local, issueId, changes, { message, author: author(), at: now });
+      commitLocal(next);
+      const op: ChangeOperation = {
+        opId: crypto.randomUUID(),
+        opType: 'edit',
+        issueId,
+        baseRevision,
+        changes,
+        author: author(),
+        at: now,
+        message,
+        status: 'pending'
+      };
+      enqueueOp(op);
+    }
   };
 
   const createIssue = (values: IssueForm) => {
-    const issue: AuditIssue = { id: crypto.randomUUID(), ...values, status: 'open', fixNote: '', retestNote: '', updatedAt: new Date().toISOString() };
-    setState('issues', (issues) => [issue, ...issues]);
+    const now = new Date().toISOString();
+    const issue: AuditIssue = {
+      id: crypto.randomUUID(),
+      title: values.title,
+      flow: values.flow,
+      steps: values.steps,
+      impactGroup: values.impactGroup,
+      severity: values.severity,
+      status: 'open',
+      fixNote: '',
+      retestNote: '',
+      revision: 1,
+      updatedAt: now
+    };
+    if (network() === 'online') {
+      const { state: next } = applyCreate(server, issue, { message: '审计员创建问题并保存证据', author: author(), at: now });
+      commitServer(next);
+    } else {
+      const { state: next } = applyCreate(local, issue, { message: '审计员创建问题并保存证据', author: author(), at: now });
+      commitLocal(next);
+      const op: ChangeOperation = {
+        opId: crypto.randomUUID(),
+        opType: 'create',
+        issueId: issue.id,
+        baseRevision: 0,
+        changes: [],
+        issueData: issue,
+        author: author(),
+        at: now,
+        message: '审计员创建问题并保存证据',
+        status: 'pending'
+      };
+      enqueueOp(op);
+    }
     setSelectedId(issue.id);
-    addEvent(issue.id, '审计员创建问题并保存证据');
-    void queryClient.invalidateQueries({ queryKey: ['audit-issues'] });
   };
 
+  /** 网络恢复后同步离线批次；合并失败则保留批次，可重试。 */
+  const sync = () => {
+    const result = syncOutbox(server, outbox, { forceFailure: forceFailure() });
+    commitServer(result.server);
+    setOutbox(result.outbox);
+    if (result.failed) {
+      setSyncMsg(`同步失败：${result.error}（已保留 ${result.outbox.batches.filter((b) => b.status === 'failed').length} 个批次，可重试）`);
+    } else if (result.conflicts > 0) {
+      setSyncMsg(`同步完成：${result.synced} 项已写入，${result.conflicts} 个字段冲突待审核`);
+    } else if (result.synced > 0) {
+      setSyncMsg(`同步完成：${result.synced} 项修改已写入`);
+    } else {
+      setSyncMsg('没有待同步的离线批次');
+    }
+  };
+
+  /** 重试失败批次：置回 queued 后重新同步；已写入的修改凭 opId 跳过，不重复追加时间线。 */
+  const retryBatch = (batchId: string) => {
+    setOutbox('batches', (batches) => batches.map((b) => (b.batchId === batchId ? { ...b, status: 'queued', error: undefined } : b)));
+    sync();
+  };
+
+  const toggleNetwork = () => {
+    if (network() === 'online') {
+      setNetwork('offline');
+      setSyncMsg('已进入离线模式：修改将排队，恢复网络后同步');
+    } else {
+      setNetwork('online');
+      sync();
+    }
+  };
+
+  /** 审核员裁定字段冲突：采用服务端版本或本地版本。 */
+  const resolveConflict = (conflictId: string, choice: 'server' | 'local') => {
+    const now = new Date().toISOString();
+    const next = resolveFieldConflict(server, conflictId, choice, { author: author(), at: now });
+    commitServer(next);
+  };
+
+  /** 重复合并：主问题、操作时间线、旧链接都指向同一个主记录。 */
   const mergeDuplicate = () => {
-    const duplicate = selected();
-    const canonical = state.issues.find((issue) => issue.id === mergeInto());
+    const duplicate = selectedRaw();
+    const canonical = local.issues.find((issue) => issue.id === mergeInto());
     if (!duplicate || !canonical || duplicate.id === canonical.id) return;
-    updateIssue(duplicate.id, { canonicalId: canonical.id }, `重复问题已合并到 ${canonical.title}`);
+    const now = new Date().toISOString();
+    const next = mergeIssues(server, duplicate.id, canonical.id, { author: author(), at: now });
+    commitServer(next);
     setSelectedId(canonical.id);
+    setMergeInto('');
+    setSyncMsg(`已合并到主问题「${canonical.title}」，时间线与旧链接已指向主记录`);
   };
 
   onMount(() => {
@@ -112,6 +221,11 @@ export default function AuditWorkbench() {
     onCleanup(() => window.removeEventListener('keydown', shortcut));
   });
 
+  const statusBadge = (status: string) => {
+    const map: Record<string, string> = { queued: '已排队', syncing: '同步中', applied: '已应用', failed: '失败待重试', conflict: '有冲突' };
+    return map[status] ?? status;
+  };
+
   return (
     <>
       <a class="skip-link" href="#main-content">跳到主要内容</a>
@@ -121,44 +235,92 @@ export default function AuditWorkbench() {
           <button class="secondary" onClick={() => setLanguage(language() === 'zh' ? 'en' : 'zh')}>{language() === 'zh' ? 'English' : '中文'}</button>
         </header>
 
+        <section class="card netbar" aria-label="网络与离线协作">
+          <div class="netbar-row">
+            <span class={`net-dot ${network() === 'online' ? 'online' : 'offline'}`}>{network() === 'online' ? '在线' : '离线'}</span>
+            <label class="inline">审核员<input value={author()} onInput={(e) => setAuthor(e.currentTarget.value)} /></label>
+            <label class="inline"><input type="checkbox" checked={forceFailure()} onChange={(e) => setForceFailure(e.currentTarget.checked)} />模拟网络恢复时合并失败</label>
+            <button class="secondary" onClick={toggleNetwork}>{network() === 'online' ? '切换到离线' : '恢复网络'}</button>
+            <button onClick={sync} disabled={pendingBatchCount() === 0}>同步离线批次{pendingBatchCount() > 0 ? `（${pendingBatchCount()}）` : ''}</button>
+          </div>
+          <Show when={syncMsg()}><p class="sync-msg" role="status">{syncMsg()}</p></Show>
+        </section>
+
+        <Show when={conflictCount() > 0}>
+          <section class="card conflict-banner" aria-label="字段冲突待审核">
+            <strong>有 {conflictCount()} 个字段冲突待审核</strong>
+            <p>同一字段被不同审核员改成不同值，已保留两版，未整条覆盖。请到「冲突待审」标签页裁定。</p>
+          </section>
+        </Show>
+
         <section class="stats" aria-label="审计概览">
-          <div class="card"><span>全部问题</span><strong>{state.issues.length}</strong></div>
-          <div class="card"><span>待修复</span><strong>{state.issues.filter((issue) => ['open', 'triaged', 'fixing', 'reopened'].includes(issue.status)).length}</strong></div>
-          <div class="card"><span>待复测</span><strong>{state.issues.filter((issue) => issue.status === 'verifying').length}</strong></div>
-          <div class="card"><span>已关闭</span><strong>{state.issues.filter((issue) => issue.status === 'closed').length}</strong></div>
+          <div class="card"><span>全部问题</span><strong>{local.issues.length}</strong></div>
+          <div class="card"><span>待修复</span><strong>{local.issues.filter((issue) => ['open', 'triaged', 'fixing', 'reopened'].includes(issue.status)).length}</strong></div>
+          <div class="card"><span>待复测</span><strong>{local.issues.filter((issue) => issue.status === 'verifying').length}</strong></div>
+          <div class="card"><span>已关闭</span><strong>{local.issues.filter((issue) => issue.status === 'closed').length}</strong></div>
         </section>
 
         <div class="grid">
           <section class="card" aria-labelledby="issue-list-title">
-            <h2 id="issue-list-title">{t()('issues')} <small>{issueQuery.isSuccess ? '同步正常' : '同步中'}</small></h2>
-            <For each={state.issues}>{(issue) => (
-              <article class="issue" style={focusedIssueId() === issue.id ? 'background:#eefaf8;border-radius:10px;padding-left:12px' : ''}>
-                <h3><button class="secondary" onClick={() => setSelectedId(issue.id)} aria-current={selectedId() === issue.id ? 'true' : undefined}>{issue.title}</button></h3>
-                <div class="meta"><span class="badge">{issue.status}</span><span class="badge">{issue.severity}</span><span>{issue.flow}</span><span>{issue.impactGroup}</span><Show when={issue.canonicalId}><span class="badge">重复项</span></Show></div>
-              </article>
-            )}</For>
+            <h2 id="issue-list-title">{t()('issues')} <small>{network() === 'online' ? '同步正常' : '离线编辑中'}</small></h2>
+            <For each={local.issues}>{(issue) => {
+              const isMerged = !!issue.canonicalId;
+              return (
+                <article class="issue" classList={{ merged: isMerged }}>
+                  <h3><button class="secondary" onClick={() => setSelectedId(issue.id)} aria-current={selectedId() === issue.id ? 'true' : undefined}>{issue.title}</button></h3>
+                  <div class="meta">
+                    <span class="badge">{issue.status}</span>
+                    <span class="badge">{issue.severity}</span>
+                    <span class="badge rev">v{issue.revision}</span>
+                    <span>{issue.flow}</span>
+                    <span>{issue.impactGroup}</span>
+                    <Show when={isMerged}><span class="badge merged-badge">已合并</span></Show>
+                  </div>
+                </article>
+              );
+            }}</For>
           </section>
 
           <section class="card" aria-labelledby="detail-title">
             <h2 id="detail-title">问题详情与状态流转</h2>
             <Show when={selected()} fallback={<p role="status">暂无审计问题。</p>}>{(_) => {
               const issue = selected()!;
-              return <>
-                <h3>{issue.title}</h3>
-                <p><strong>复现步骤：</strong>{issue.steps}</p>
-                <p><strong>修复记录：</strong>{issue.fixNote || '尚未填写'}</p>
-                <p><strong>复测记录：</strong>{issue.retestNote || '尚未填写'}</p>
-                <div role="group" aria-label="问题状态操作">
-                  <button onClick={() => updateIssue(issue.id, { status: 'triaged' }, '审核员完成分诊')}>确认问题</button>{' '}
-                  <button onClick={() => updateIssue(issue.id, { status: 'fixing', fixNote: '修复进行中，等待提交复测版本' }, '开发人员开始修复')}>开始修复</button>{' '}
-                  <button onClick={() => updateIssue(issue.id, { status: 'verifying' }, '开发人员提交修复，进入复测')}>提交复测</button>{' '}
-                  <button onClick={() => updateIssue(issue.id, { status: 'closed', retestNote: '键盘、读屏和错误提示均已通过' }, '复测通过并关闭问题')}>复测通过</button>{' '}
-                  <button class="danger" onClick={() => updateIssue(issue.id, { status: 'reopened', retestNote: '焦点顺序仍不正确' }, '复测失败并重新打开')}>复测失败</button>
-                </div>
-                <hr />
-                <label>合并到主问题<select value={mergeInto()} onChange={(event) => setMergeInto(event.currentTarget.value)}><option value="">选择问题</option><For each={state.issues.filter((item) => item.id !== issue.id && !item.canonicalId)}>{(item) => <option value={item.id}>{item.title}</option>}</For></select></label>
-                <button disabled={!mergeInto()} onClick={mergeDuplicate}>确认重复合并</button>
-              </>;
+              const raw = selectedRaw();
+              return (
+                <>
+                  <Show when={isMergedView()}>
+                    <p class="merge-banner" role="status">此问题已合并到主问题「{issue.title}」，操作时间线与旧链接已指向主记录。</p>
+                  </Show>
+                  <h3>{issue.title} <span class="badge rev">v{issue.revision}</span></h3>
+                  <p><strong>复现步骤：</strong>{issue.steps}</p>
+                  <p><strong>修复记录：</strong>{issue.fixNote || '尚未填写'}</p>
+                  <p><strong>复测记录：</strong>{issue.retestNote || '尚未填写'}</p>
+                  <div role="group" aria-label="问题状态操作">
+                    <button onClick={() => editIssue(issue.id, [{ field: 'status', fieldLabel: FIELD_LABELS.status, from: issue.status, to: 'triaged' }], '审核员完成分诊')}>确认问题</button>{' '}
+                    <button onClick={() => editIssue(issue.id, [
+                      { field: 'status', fieldLabel: FIELD_LABELS.status, from: issue.status, to: 'fixing' },
+                      { field: 'fixNote', fieldLabel: FIELD_LABELS.fixNote, from: issue.fixNote, to: '修复进行中，等待提交复测版本' }
+                    ], '开发人员开始修复')}>开始修复</button>{' '}
+                    <button onClick={() => editIssue(issue.id, [{ field: 'status', fieldLabel: FIELD_LABELS.status, from: issue.status, to: 'verifying' }], '开发人员提交修复，进入复测')}>提交复测</button>{' '}
+                    <button onClick={() => editIssue(issue.id, [
+                      { field: 'status', fieldLabel: FIELD_LABELS.status, from: issue.status, to: 'closed' },
+                      { field: 'retestNote', fieldLabel: FIELD_LABELS.retestNote, from: issue.retestNote, to: '键盘、读屏和错误提示均已通过' }
+                    ], '复测通过并关闭问题')}>复测通过</button>{' '}
+                    <button class="danger" onClick={() => editIssue(issue.id, [
+                      { field: 'status', fieldLabel: FIELD_LABELS.status, from: issue.status, to: 'reopened' },
+                      { field: 'retestNote', fieldLabel: FIELD_LABELS.retestNote, from: issue.retestNote, to: '焦点顺序仍不正确' }
+                    ], '复测失败并重新打开')}>复测失败</button>
+                  </div>
+                  <hr />
+                  <label>合并到主问题
+                    <select value={mergeInto()} onChange={(event) => setMergeInto(event.currentTarget.value)}>
+                      <option value="">选择问题</option>
+                      <For each={local.issues.filter((item) => item.id !== raw?.id && !item.canonicalId)}>{(item) => <option value={item.id}>{item.title}</option>}</For>
+                    </select>
+                  </label>
+                  <button disabled={!mergeInto() || isMergedView()} onClick={mergeDuplicate}>确认重复合并</button>
+                </>
+              );
             }}</Show>
           </section>
         </div>
@@ -167,11 +329,11 @@ export default function AuditWorkbench() {
           <section class="card">
             <h2>新建审计问题</h2>
             <AuditForm onSubmit={createIssue} style="margin-top:12px">
-              <AuditField name="title">{ (field, props) => <label>问题标题<input id="issue-title" {...props} value={field.value} onInput={(event) => field.value = event.currentTarget.value} aria-invalid={field.error ? 'true' : undefined} aria-describedby={field.error ? 'title-error' : undefined} /><Show when={field.error}><p class="error" id="title-error" role="alert">{field.error}</p></Show></label> }</AuditField>
-              <AuditField name="flow">{ (field, props) => <label>业务流程<input {...props} value={field.value} onInput={(event) => field.value = event.currentTarget.value} /></label> }</AuditField>
-              <AuditField name="steps">{ (field, props) => <label>复现步骤<textarea {...props} rows={4} value={field.value} onInput={(event) => field.value = event.currentTarget.value} /></label> }</AuditField>
-              <AuditField name="impactGroup">{ (field) => <label>影响人群<select value={field.value} onChange={(event) => field.value = event.currentTarget.value}><option>键盘与读屏用户</option><option>低视力用户</option><option>认知障碍用户</option><option>行动障碍用户</option></select></label> }</AuditField>
-              <AuditField name="severity">{ (field) => <label>严重程度<select value={field.value} onChange={(event) => field.value = event.currentTarget.value as Severity}><option value="critical">阻断</option><option value="serious">严重</option><option value="moderate">中等</option><option value="minor">轻微</option></select></label> }</AuditField>
+              <AuditField name="title">{(field, props) => <label>问题标题<input id="issue-title" {...props} value={field.value} onInput={(event) => setValue(form, 'title', event.currentTarget.value)} aria-invalid={field.error ? 'true' : undefined} aria-describedby={field.error ? 'title-error' : undefined} /><Show when={field.error}><p class="error" id="title-error" role="alert">{field.error}</p></Show></label>}</AuditField>
+              <AuditField name="flow">{(field, props) => <label>业务流程<input {...props} value={field.value} onInput={(event) => setValue(form, 'flow', event.currentTarget.value)} /></label>}</AuditField>
+              <AuditField name="steps">{(field, props) => <label>复现步骤<textarea {...props} rows={4} value={field.value} onInput={(event) => setValue(form, 'steps', event.currentTarget.value)} /></label>}</AuditField>
+              <AuditField name="impactGroup">{(field) => <label>影响人群<select value={field.value} onChange={(event) => setValue(form, 'impactGroup', event.currentTarget.value)}><option>键盘与读屏用户</option><option>低视力用户</option><option>认知障碍用户</option><option>行动障碍用户</option></select></label>}</AuditField>
+              <AuditField name="severity">{(field) => <label>严重程度<select value={field.value} onChange={(event) => setValue(form, 'severity', event.currentTarget.value as Severity)}><option value="critical">阻断</option><option value="serious">严重</option><option value="moderate">中等</option><option value="minor">轻微</option></select></label>}</AuditField>
               <button type="submit">创建问题</button>
             </AuditForm>
           </section>
@@ -179,9 +341,102 @@ export default function AuditWorkbench() {
           <section class="card tabs">
             <h2>{t()('events')}</h2>
             <Tabs.Root defaultValue="activity">
-              <Tabs.List><Tabs.Trigger value="activity">操作记录</Tabs.Trigger><Tabs.Trigger value="keyboard">键盘说明</Tabs.Trigger></Tabs.List>
-              <Tabs.Content value="activity"><div class="timeline" aria-live="polite"><For each={state.events.slice(0, 12)}>{(event) => <div style="margin-bottom:12px"><strong>{new Date(event.at).toLocaleString()}</strong><div>{event.message}</div></div>}</For></div></Tabs.Content>
-              <Tabs.Content value="keyboard"><ul><li><kbd>N</kbd>：聚焦新建问题标题</li><li><kbd>Tab</kbd> / <kbd>Shift+Tab</kbd>：按可见顺序移动焦点</li><li><kbd>Ctrl+Enter</kbd>：表单支持键盘提交</li><li>所有错误消息使用 <code>role="alert"</code> 并通过描述关系关联字段</li></ul></Tabs.Content>
+              <Tabs.List>
+                <Tabs.Trigger value="activity">操作记录</Tabs.Trigger>
+                <Tabs.Trigger value="outbox">离线批次{pendingBatchCount() > 0 ? `（${pendingBatchCount()}）` : ''}</Tabs.Trigger>
+                <Tabs.Trigger value="conflicts">冲突待审{conflictCount() > 0 ? `（${conflictCount()}）` : ''}</Tabs.Trigger>
+                <Tabs.Trigger value="keyboard">键盘说明</Tabs.Trigger>
+              </Tabs.List>
+
+              <Tabs.Content value="activity">
+                <div class="timeline" aria-live="polite">
+                  <For each={local.events.slice(0, 15)}>{(event: AuditEvent) => {
+                    const issue = local.issues.find((i) => i.id === event.issueId);
+                    return (
+                      <div class="timeline-item">
+                        <div class="timeline-head">
+                          <strong>{new Date(event.at).toLocaleString()}</strong>
+                          <Show when={event.author}><span class="badge">{event.author}</span></Show>
+                          <Show when={event.revision}><span class="badge rev">v{event.revision}</span></Show>
+                          <Show when={issue}><span class="timeline-issue">{issue!.title}</span></Show>
+                        </div>
+                        <div>{event.message}</div>
+                      </div>
+                    );
+                  }}</For>
+                </div>
+              </Tabs.Content>
+
+              <Tabs.Content value="outbox">
+                <Show when={outbox.batches.length === 0} fallback={
+                  <div class="outbox-list">
+                    <For each={outbox.batches}>{(batch) => (
+                      <div class="outbox-batch" classList={{ failed: batch.status === 'failed' }}>
+                        <div class="outbox-head">
+                          <span class="badge">{statusBadge(batch.status)}</span>
+                          <span class="outbox-time">{new Date(batch.createdAt).toLocaleString()}</span>
+                          <Show when={batch.status === 'failed'}><button class="secondary small" onClick={() => retryBatch(batch.batchId)}>重试</button></Show>
+                        </div>
+                        <Show when={batch.error}><p class="error" role="alert">{batch.error}</p></Show>
+                        <ul class="outbox-ops">
+                          <For each={batch.ops}>{(op) => {
+                            const issue = local.issues.find((i) => i.id === op.issueId);
+                            return (
+                              <li>
+                                <span class="badge rev">{op.opType === 'create' ? '新建' : '编辑'}</span>
+                                <Show when={issue}><span>{issue!.title}</span></Show>
+                                <span class="badge">{statusBadge(op.status)}</span>
+                                <span class="outbox-msg">{op.message}</span>
+                              </li>
+                            );
+                          }}</For>
+                        </ul>
+                      </div>
+                    )}</For>
+                  </div>
+                }>
+                  <p role="status">暂无离线批次。离线时的修改会按问题排队，恢复网络后同步。</p>
+                </Show>
+              </Tabs.Content>
+
+              <Tabs.Content value="conflicts">
+                <Show when={server.conflicts.filter((c) => c.status === 'pending').length === 0} fallback={
+                  <div class="conflict-list">
+                    <For each={server.conflicts.filter((c) => c.status === 'pending')}>{(c) => {
+                      const issue = local.issues.find((i) => i.id === c.issueId);
+                      return (
+                        <div class="conflict-item">
+                          <div class="conflict-head">
+                            <strong>{c.fieldLabel}</strong>
+                            <Show when={issue}><span class="timeline-issue">{issue!.title}</span></Show>
+                            <span class="badge">{c.author}</span>
+                          </div>
+                          <div class="conflict-versions">
+                            <div class="conflict-version"><span class="version-tag">基线</span><code>{String(c.baseValue || '（空）')}</code></div>
+                            <div class="conflict-version"><span class="version-tag server">服务端版本</span><code>{String(c.serverValue || '（空）')}</code></div>
+                            <div class="conflict-version"><span class="version-tag local">本地版本</span><code>{String(c.localValue || '（空）')}</code></div>
+                          </div>
+                          <div class="conflict-actions">
+                            <button class="secondary small" onClick={() => resolveConflict(c.id, 'server')}>保留服务端版本</button>
+                            <button class="small" onClick={() => resolveConflict(c.id, 'local')}>采用本地版本</button>
+                          </div>
+                        </div>
+                      );
+                    }}</For>
+                  </div>
+                }>
+                  <p role="status">暂无待审核的字段冲突。</p>
+                </Show>
+              </Tabs.Content>
+
+              <Tabs.Content value="keyboard">
+                <ul>
+                  <li><kbd>N</kbd>：聚焦新建问题标题</li>
+                  <li><kbd>Tab</kbd> / <kbd>Shift+Tab</kbd>：按可见顺序移动焦点</li>
+                  <li><kbd>Ctrl+Enter</kbd>：表单支持键盘提交</li>
+                  <li>所有错误消息使用 <code>role="alert"</code> 并通过描述关系关联字段</li>
+                </ul>
+              </Tabs.Content>
             </Tabs.Root>
           </section>
         </div>
