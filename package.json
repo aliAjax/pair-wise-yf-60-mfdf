@@ -8,7 +8,8 @@
     "build": "vinxi build",
     "start": "vinxi start --host 0.0.0.0 --port 62025",
     "preview": "vinxi start --host 0.0.0.0 --port 62025",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "esbuild scripts/selftest.mjs --bundle --platform=node --format=esm --outfile=.output/selftest.mjs && node .output/selftest.mjs && esbuild scripts/e2e.ts --bundle --platform=node --format=esm --outfile=.output/e2e.mjs && node .output/e2e.mjs"
   },
   "dependencies": {
     "@ark-ui/solid": "^5.39.2",
